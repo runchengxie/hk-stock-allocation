@@ -33,6 +33,64 @@ def safe_float(value: Any) -> float:
         return float("nan")
 
 
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (float, np.floating)) and math.isnan(float(value)):
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "none", "nan"}
+    return False
+
+
+def _pick_last_non_missing(values: Sequence[Any]) -> Any:
+    for value in reversed(list(values)):
+        if not _is_missing_value(value):
+            return value
+    return None
+
+
+def _pick_round_lot(values: Sequence[Any]) -> float:
+    numeric = pd.to_numeric(pd.Series(list(values)), errors="coerce").dropna()
+    if numeric.empty:
+        return float("nan")
+    return float(numeric.max())
+
+
+def _coerce_scalar(value: Any) -> Any:
+    if isinstance(value, pd.DataFrame):
+        if value.empty:
+            return None
+        value = value.iloc[-1]
+    if isinstance(value, pd.Series):
+        return _pick_last_non_missing(value.tolist())
+    return value
+
+
+def _resolve_display_name(config_name: str | None, instrument_symbol: Any) -> str | None:
+    if isinstance(config_name, str) and config_name.strip():
+        return config_name.strip()
+    symbol = _coerce_scalar(instrument_symbol)
+    if _is_missing_value(symbol):
+        return None
+    text = str(symbol).strip()
+    return text or None
+
+
+def _get_instrument_field(instruments_df: pd.DataFrame, oid: str, field: str, default: Any) -> Any:
+    if oid not in instruments_df.index or field not in instruments_df.columns:
+        return default
+    value = _coerce_scalar(instruments_df.loc[oid, field])
+    if _is_missing_value(value):
+        return default
+    return value
+
+
 def classify_valuation(
     percentile: float,
     zscore: float,
@@ -147,7 +205,16 @@ def fetch_instruments(rqdatac_module: Any, order_book_ids: Sequence[str], market
     if not rows:
         return pd.DataFrame(columns=["symbol", "round_lot", "stock_connect"])
 
-    return pd.DataFrame(rows).set_index("order_book_id")
+    raw = pd.DataFrame(rows)
+    grouped = (
+        raw.groupby("order_book_id", sort=False, as_index=True)
+        .agg(
+            symbol=("symbol", lambda s: _pick_last_non_missing(s.tolist())),
+            round_lot=("round_lot", _pick_round_lot),
+            stock_connect=("stock_connect", lambda s: _pick_last_non_missing(s.tolist())),
+        )
+    )
+    return grouped
 
 
 def fetch_close_prices(
@@ -399,8 +466,9 @@ def build_allocation_table(
         ticker = item.ticker
         oid = ticker_to_oid[ticker]
 
-        round_lot = safe_float(instruments_df.loc[oid, "round_lot"]) if oid in instruments_df.index else np.nan
-        stock_connect = instruments_df.loc[oid, "stock_connect"] if oid in instruments_df.index else None
+        symbol = _get_instrument_field(instruments_df, oid, "symbol", None)
+        round_lot = safe_float(_get_instrument_field(instruments_df, oid, "round_lot", np.nan))
+        stock_connect = _get_instrument_field(instruments_df, oid, "stock_connect", None)
         price = safe_float(price_row.get(oid, np.nan))
 
         is_connect_tradable = _is_stock_connect_tradable(stock_connect)
@@ -427,7 +495,7 @@ def build_allocation_table(
             {
                 "ticker": ticker,
                 "order_book_id": oid,
-                "name": item.name,
+                "name": _resolve_display_name(item.name, symbol),
                 "price": price,
                 "round_lot": round_lot,
                 "stock_connect": stock_connect,
