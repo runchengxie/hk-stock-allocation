@@ -7,7 +7,15 @@ portfolio:
     secondary_fill:
       enabled: true
       avoid_high_valuation: true
-      max_steps: 100000
+      avoid_high_valuation_strict: false
+      max_steps: 5000
+      allow_over_alloc: false
+      max_over_alloc_ratio: 0.001
+      max_over_alloc_amount: 2000
+      max_over_alloc_lots_per_ticker: 1
+      cash_buffer_ratio: 0.002
+      cash_buffer_amount: 0
+      estimated_fee_per_order: 0
   trading:
     market: hk
     require_stock_connect: true

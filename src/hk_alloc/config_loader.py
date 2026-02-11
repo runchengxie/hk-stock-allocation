@@ -25,7 +25,15 @@ class PortfolioConfig:
     allocation_method: str = "equal"
     secondary_fill_enabled: bool = True
     secondary_fill_avoid_high_valuation: bool = True
-    secondary_fill_max_steps: int = 100000
+    secondary_fill_avoid_high_valuation_strict: bool = False
+    secondary_fill_max_steps: int = 5000
+    secondary_fill_allow_over_alloc: bool = False
+    secondary_fill_max_over_alloc_ratio: float = 0.0
+    secondary_fill_max_over_alloc_amount: float = 0.0
+    secondary_fill_max_over_alloc_lots_per_ticker: int = 1
+    secondary_fill_cash_buffer_ratio: float = 0.0
+    secondary_fill_cash_buffer_amount: float = 0.0
+    secondary_fill_estimated_fee_per_order: float = 0.0
     valuation: ValuationConfig = ValuationConfig()
 
 
@@ -79,7 +87,21 @@ def load_portfolio_yaml(path: str | Path) -> tuple[PortfolioConfig, list[TickerC
         allocation_method=str(allocation_data.get("method", "equal")).lower(),
         secondary_fill_enabled=bool(secondary_fill_data.get("enabled", True)),
         secondary_fill_avoid_high_valuation=bool(secondary_fill_data.get("avoid_high_valuation", True)),
-        secondary_fill_max_steps=int(secondary_fill_data.get("max_steps", 100000)),
+        secondary_fill_avoid_high_valuation_strict=bool(
+            secondary_fill_data.get("avoid_high_valuation_strict", False)
+        ),
+        secondary_fill_max_steps=int(secondary_fill_data.get("max_steps", 5000)),
+        secondary_fill_allow_over_alloc=bool(secondary_fill_data.get("allow_over_alloc", False)),
+        secondary_fill_max_over_alloc_ratio=float(secondary_fill_data.get("max_over_alloc_ratio", 0.0)),
+        secondary_fill_max_over_alloc_amount=float(secondary_fill_data.get("max_over_alloc_amount", 0.0)),
+        secondary_fill_max_over_alloc_lots_per_ticker=int(
+            secondary_fill_data.get("max_over_alloc_lots_per_ticker", 1)
+        ),
+        secondary_fill_cash_buffer_ratio=float(secondary_fill_data.get("cash_buffer_ratio", 0.0)),
+        secondary_fill_cash_buffer_amount=float(secondary_fill_data.get("cash_buffer_amount", 0.0)),
+        secondary_fill_estimated_fee_per_order=float(
+            secondary_fill_data.get("estimated_fee_per_order", 0.0)
+        ),
         valuation=valuation,
     )
 
@@ -89,6 +111,22 @@ def load_portfolio_yaml(path: str | Path) -> tuple[PortfolioConfig, list[TickerC
         raise ValueError("portfolio.allocation.method must be one of: equal, custom")
     if config.secondary_fill_max_steps <= 0:
         raise ValueError("portfolio.allocation.secondary_fill.max_steps must be > 0")
+    if config.secondary_fill_max_over_alloc_ratio < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.max_over_alloc_ratio must be >= 0")
+    if config.secondary_fill_max_over_alloc_amount < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.max_over_alloc_amount must be >= 0")
+    if config.secondary_fill_max_over_alloc_lots_per_ticker < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.max_over_alloc_lots_per_ticker must be >= 0")
+    if config.secondary_fill_cash_buffer_ratio < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.cash_buffer_ratio must be >= 0")
+    if config.secondary_fill_cash_buffer_amount < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.cash_buffer_amount must be >= 0")
+    if config.secondary_fill_estimated_fee_per_order < 0:
+        raise ValueError("portfolio.allocation.secondary_fill.estimated_fee_per_order must be >= 0")
+    if config.secondary_fill_allow_over_alloc and config.secondary_fill_max_over_alloc_lots_per_ticker == 0:
+        raise ValueError(
+            "portfolio.allocation.secondary_fill.max_over_alloc_lots_per_ticker must be > 0 when allow_over_alloc=true"
+        )
     if not (0.0 < valuation.sell_quantile < 1.0):
         raise ValueError("portfolio.valuation.sell_quantile must be in (0, 1)")
     if not (0.0 < valuation.extreme_quantile < 1.0):

@@ -2,14 +2,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
+from hk_alloc.config_loader import PortfolioConfig, TickerConfig, ValuationConfig
 from hk_alloc.rq_helpers import (
+    _is_stock_connect_tradable,
     _normalize_close_output,
     _prepare_allocation_export_df,
     _prepare_sell_signals_export_df,
     _prepare_summary_export_df,
     _resolve_display_name,
+    build_allocation_table,
     build_latest_price_frame,
+    build_sell_signals,
     fetch_instruments,
     write_report,
 )
@@ -156,7 +161,7 @@ def test_prepare_allocation_export_df_localizes_headers_and_values() -> None:
     )
 
     out = _prepare_allocation_export_df(allocation)
-    assert list(out.columns[:6]) == ["股票代码", "名称", "合计手数", "当前价格", "估值分层", "高估上沿"]
+    assert list(out.columns[:6]) == ["股票代码", "名称", "合计手数", "当前价格", "估值分层", "统计高位上沿(未复权)"]
     assert out.loc[0, "可交易"] == "是"
     assert out.loc[0, "港股通"] == "沪/深"
     assert out.loc[0, "价格来源"] == "快照最新价"
@@ -192,6 +197,9 @@ def test_prepare_summary_export_df_orders_and_localizes() -> None:
                 "secondary_fill_enabled": True,
                 "secondary_fill_steps": 3,
                 "secondary_fill_spent": 60_000.0,
+                "secondary_fill_fee_spent": 100.0,
+                "secondary_fill_cash_buffer": 2_000.0,
+                "secondary_fill_budget_after_buffer": 998_000.0,
                 "cash_remaining_after_fill": 20_000.0,
             }
         ]
@@ -201,6 +209,172 @@ def test_prepare_summary_export_df_orders_and_localizes() -> None:
     assert list(out.columns[:6]) == ["组合名称", "统计日期", "定价日期", "价格来源", "价格来源明细", "标的数量"]
     assert out.loc[0, "价格来源"] == "快照最新价"
     assert out.loc[0, "启用二次补仓"] == "是"
+    assert out.loc[0, "补仓估算费用"] == 100.0
+
+
+def test_fetch_instruments_round_lot_prefers_mode_over_max(caplog: pytest.LogCaptureFixture) -> None:
+    class DummyRQ:
+        def instruments(self, order_book_ids: list[str], market: str):  # noqa: ANN201
+            assert order_book_ids == ["00300.XHKG"]
+            assert market == "hk"
+            return [
+                SimpleNamespace(
+                    order_book_id="00300.XHKG",
+                    symbol="Midea Group",
+                    round_lot=100,
+                    stock_connect=["sh", "sz"],
+                ),
+                SimpleNamespace(
+                    order_book_id="00300.XHKG",
+                    symbol="Midea Group",
+                    round_lot=200,
+                    stock_connect=["sh", "sz"],
+                ),
+                SimpleNamespace(
+                    order_book_id="00300.XHKG",
+                    symbol="Midea Group",
+                    round_lot=100,
+                    stock_connect=["sh", "sz"],
+                ),
+            ]
+
+    with caplog.at_level("WARNING"):
+        out = fetch_instruments(DummyRQ(), ["00300.XHKG"], market="hk")
+    assert out.loc["00300.XHKG", "round_lot"] == 100.0
+    assert "Multiple round_lot values found" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("yes", True),
+        ("是", True),
+        ("沪港通", True),
+        ("sh,sz", True),
+        ("否", False),
+        ("not eligible", False),
+        ("unknown", False),
+        (["sh", "sz"], True),
+        (["none", "否"], False),
+    ],
+)
+def test_is_stock_connect_tradable_handles_multilingual_values(raw, expected) -> None:  # noqa: ANN001
+    assert _is_stock_connect_tradable(raw) is expected
+
+
+def test_build_allocation_table_uses_unadjusted_history_for_thresholds() -> None:
+    calls: list[str] = []
+
+    class DummyRQ:
+        def get_previous_trading_date(self, ref_date, n, market):  # noqa: ANN201, ANN001
+            return ref_date
+
+        def get_price(  # noqa: ANN201, ANN001
+            self,
+            order_book_ids,
+            start_date,
+            end_date,
+            frequency,
+            fields,
+            adjust_type,
+            market,
+            expect_df,
+        ):
+            calls.append(str(adjust_type))
+            assert adjust_type == "none"
+            assert order_book_ids == ["00941.XHKG"]
+            return pd.DataFrame(
+                {"00941.XHKG": [80.0, 81.0, 82.0]},
+                index=pd.to_datetime(["2026-02-08", "2026-02-09", "2026-02-10"]),
+            )
+
+        def instruments(self, order_book_ids: list[str], market: str):  # noqa: ANN201
+            return [
+                SimpleNamespace(
+                    order_book_id="00941.XHKG",
+                    symbol="China Mobile",
+                    round_lot=500,
+                    stock_connect=["sh", "sz"],
+                )
+            ]
+
+    portfolio = PortfolioConfig(
+        name="demo",
+        currency="HKD",
+        total_capital=100_000,
+        secondary_fill_enabled=False,
+        valuation=ValuationConfig(
+            history_years=1,
+            roll_window=2,
+            sell_quantile=0.8,
+            extreme_quantile=0.9,
+        ),
+    )
+    tickers = [TickerConfig(ticker="00941.HK")]
+    allocation_df, _ = build_allocation_table(
+        DummyRQ(),
+        portfolio=portfolio,
+        ticker_configs=tickers,
+        as_of=pd.Timestamp("2026-02-10").date(),
+    )
+
+    assert calls
+    assert set(calls) == {"none"}
+    assert "overpriced_high" in allocation_df.columns
+
+
+def test_build_sell_signals_uses_prior_day_trigger_for_cross() -> None:
+    class DummyRQ:
+        def get_previous_trading_date(self, ref_date, n, market):  # noqa: ANN201, ANN001
+            return ref_date
+
+        def get_price(  # noqa: ANN201, ANN001
+            self,
+            order_book_ids,
+            start_date,
+            end_date,
+            frequency,
+            fields,
+            adjust_type,
+            market,
+            expect_df,
+        ):
+            assert adjust_type == "pre"
+            return pd.DataFrame(
+                {"00941.XHKG": [1.0, 0.5, 2.0]},
+                index=pd.to_datetime(["2026-02-08", "2026-02-09", "2026-02-10"]),
+            )
+
+        def instruments(self, order_book_ids: list[str], market: str):  # noqa: ANN201
+            return [
+                SimpleNamespace(
+                    order_book_id="00941.XHKG",
+                    symbol="China Mobile",
+                    round_lot=500,
+                    stock_connect=["sh", "sz"],
+                )
+            ]
+
+    portfolio = PortfolioConfig(
+        name="demo",
+        currency="HKD",
+        total_capital=100_000,
+        valuation=ValuationConfig(
+            history_years=1,
+            roll_window=2,
+            sell_quantile=0.8,
+            extreme_quantile=0.9,
+        ),
+    )
+    tickers = [TickerConfig(ticker="00941.HK")]
+    out = build_sell_signals(
+        DummyRQ(),
+        portfolio=portfolio,
+        ticker_configs=tickers,
+        as_of=pd.Timestamp("2026-02-10").date(),
+    )
+
+    assert out.loc[0, "last_sell_signal_date"] == pd.Timestamp("2026-02-10").date()
 
 
 def test_prepare_sell_signals_export_df_orders_and_localizes() -> None:

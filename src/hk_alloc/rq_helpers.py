@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import logging
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -10,6 +12,40 @@ import numpy as np
 import pandas as pd
 
 from .config_loader import PortfolioConfig, TickerConfig, get_active_tickers
+
+LOGGER = logging.getLogger(__name__)
+
+STOCK_CONNECT_TRUE_VALUES: set[str] = {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "是",
+    "沪港通",
+    "深港通",
+    "southbound",
+    "eligible",
+    "sh",
+    "sz",
+    "沪",
+    "深",
+}
+
+STOCK_CONNECT_FALSE_VALUES: set[str] = {
+    "",
+    "0",
+    "false",
+    "no",
+    "n",
+    "none",
+    "nan",
+    "null",
+    "否",
+    "不是",
+    "不可",
+    "不支持",
+    "not eligible",
+}
 
 
 VALUATION_CN_MAP: dict[str, str] = {
@@ -76,9 +112,9 @@ ALLOCATION_EXPORT_RENAME: dict[str, str] = {
     "valuation": "估值分层",
     "pct_1y": "1年分位",
     "z_1y": "1年Z分",
-    "overpriced_low": "高估下沿",
-    "overpriced_high": "高估上沿",
-    "overpriced_range": "高估区间",
+    "overpriced_low": "统计高位下沿(未复权)",
+    "overpriced_high": "统计高位上沿(未复权)",
+    "overpriced_range": "统计高位区间(未复权)",
 }
 
 SUMMARY_EXPORT_RENAME: dict[str, str] = {
@@ -95,6 +131,9 @@ SUMMARY_EXPORT_RENAME: dict[str, str] = {
     "secondary_fill_enabled": "启用二次补仓",
     "secondary_fill_steps": "补仓步数",
     "secondary_fill_spent": "补仓金额",
+    "secondary_fill_fee_spent": "补仓估算费用",
+    "secondary_fill_cash_buffer": "补仓现金缓冲",
+    "secondary_fill_budget_after_buffer": "补仓可用资金",
     "cash_remaining_after_fill": "补仓后剩余现金",
 }
 
@@ -112,6 +151,9 @@ SUMMARY_EXPORT_ORDER: list[str] = [
     "secondary_fill_enabled",
     "secondary_fill_steps",
     "secondary_fill_spent",
+    "secondary_fill_fee_spent",
+    "secondary_fill_cash_buffer",
+    "secondary_fill_budget_after_buffer",
     "cash_remaining_after_fill",
 ]
 
@@ -189,10 +231,30 @@ def _pick_last_non_missing(values: Sequence[Any]) -> Any:
 
 
 def _pick_round_lot(values: Sequence[Any]) -> float:
-    numeric = pd.to_numeric(pd.Series(list(values)), errors="coerce").dropna()
+    raw = pd.to_numeric(pd.Series(list(values)), errors="coerce")
+    numeric = raw.dropna()
     if numeric.empty:
         return float("nan")
-    return float(numeric.max())
+    unique_values = sorted({float(v) for v in numeric.tolist()})
+    if len(unique_values) > 1:
+        LOGGER.warning("Multiple round_lot values found %s; using mode then last non-missing.", unique_values)
+
+    counts = numeric.value_counts()
+    if counts.empty:
+        return float("nan")
+
+    top_count = int(counts.max())
+    mode_values = [float(val) for val, count in counts.items() if int(count) == top_count]
+    if len(mode_values) == 1:
+        return mode_values[0]
+
+    for value in reversed(raw.tolist()):
+        if pd.isna(value):
+            continue
+        value_float = float(value)
+        if value_float in mode_values:
+            return value_float
+    return mode_values[0]
 
 
 def _coerce_scalar(value: Any) -> Any:
@@ -607,13 +669,31 @@ def build_target_values(
 def _is_stock_connect_tradable(value: Any) -> bool:
     if isinstance(value, bool):
         return value
-    if value is None:
+    if _is_missing_value(value):
         return False
-    text = str(value).strip().lower()
-    return text not in {"", "none", "nan", "false", "0", "no"}
+    if isinstance(value, (list, tuple, set)):
+        return any(_is_stock_connect_tradable(item) for item in value)
+
+    text = re.sub(r"\s+", " ", str(value).strip().lower())
+    if text in STOCK_CONNECT_TRUE_VALUES:
+        return True
+    if text in STOCK_CONNECT_FALSE_VALUES:
+        return False
+
+    tokens = [token for token in re.split(r"[,\s/|]+", text) if token]
+    if tokens:
+        if any(token in STOCK_CONNECT_TRUE_VALUES for token in tokens):
+            return True
+        if all(token in STOCK_CONNECT_FALSE_VALUES for token in tokens):
+            return False
+    return False
 
 
 def _to_date(value: Any) -> date:
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    if isinstance(value, datetime):
+        return value.date()
     if isinstance(value, date):
         return value
     return pd.to_datetime(value).date()
@@ -637,38 +717,121 @@ def apply_secondary_fill(
     total_capital: float,
     enabled: bool,
     avoid_high_valuation: bool,
+    avoid_high_valuation_strict: bool,
     max_steps: int,
+    allow_over_alloc: bool,
+    max_over_alloc_ratio: float,
+    max_over_alloc_amount: float,
+    max_over_alloc_lots_per_ticker: int,
+    cash_buffer_ratio: float,
+    cash_buffer_amount: float,
+    estimated_fee_per_order: float,
 ) -> tuple[pd.DataFrame, dict[str, float | int | bool]]:
     updated = allocation_df.copy()
     if "lots_extra" not in updated.columns:
         updated["lots_extra"] = 0
+    updated["lots_extra"] = pd.to_numeric(updated["lots_extra"], errors="coerce").fillna(0).astype(int)
+
+    def recompute_position_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame.copy()
+        for idx, row in out.iterrows():
+            lots_raw = safe_float(row.get("lots", 0))
+            lots = max(int(lots_raw) if not math.isnan(lots_raw) else 0, 0)
+            round_lot = safe_float(row.get("round_lot", np.nan))
+            price = safe_float(row.get("price", np.nan))
+            lot_cost_existing = safe_float(row.get("lot_cost", np.nan))
+            if (math.isnan(price) or price <= 0) and round_lot > 0 and not math.isnan(round_lot):
+                if lot_cost_existing > 0:
+                    price = lot_cost_existing / round_lot
+            target_value = safe_float(row.get("target_value", np.nan))
+            tradable = bool(row.get("tradable", False))
+
+            shares = int(round(lots * round_lot)) if round_lot > 0 and not math.isnan(round_lot) else 0
+            est_value = float(shares * price) if price > 0 and not math.isnan(price) else 0.0
+            lot_cost = float(price * round_lot) if tradable and price > 0 and round_lot > 0 else float("nan")
+            if math.isnan(target_value):
+                target_value = 0.0
+
+            out.at[idx, "lots"] = lots
+            out.at[idx, "shares"] = shares
+            out.at[idx, "est_value"] = est_value
+            out.at[idx, "lot_cost"] = lot_cost
+            out.at[idx, "gap_to_target"] = float(target_value - est_value)
+        return out
+
+    buffer_amount = float(total_capital * max(cash_buffer_ratio, 0.0) + max(cash_buffer_amount, 0.0))
+    available_budget = max(float(total_capital - buffer_amount), 0.0)
 
     if not enabled or updated.empty:
+        updated = recompute_position_columns(updated)
         return (
             updated,
             {
                 "secondary_fill_enabled": bool(enabled),
                 "secondary_fill_steps": 0,
                 "secondary_fill_spent": 0.0,
+                "secondary_fill_fee_spent": 0.0,
+                "secondary_fill_cash_buffer": float(buffer_amount),
+                "secondary_fill_budget_after_buffer": float(available_budget),
                 "cash_remaining_after_fill": max(total_capital - float(updated["est_value"].sum()), 0.0),
             },
         )
 
     eps = 1e-9
+    over_alloc_caps: list[float] = []
+    if allow_over_alloc and max_over_alloc_ratio > 0:
+        over_alloc_caps.append(float(total_capital * max_over_alloc_ratio))
+    if allow_over_alloc and max_over_alloc_amount > 0:
+        over_alloc_caps.append(float(max_over_alloc_amount))
+    max_over_alloc_value = min(over_alloc_caps) if over_alloc_caps else (float("inf") if allow_over_alloc else 0.0)
+
     valuation_rank = {"LOW": 0, "NEUTRAL": 1, "HIGH": 2, "EXTREME": 3, "NA": 4}
     disallowed_when_avoid = {"HIGH", "EXTREME"}
+    over_alloc_count_by_idx: dict[Any, int] = {idx: 0 for idx in updated.index}
 
     def candidate_rows(cash_left: float) -> pd.DataFrame:
         candidates = updated[
             (updated["tradable"] == True)
             & (updated["lot_cost"] > 0)
-            & (updated["lot_cost"] <= cash_left + eps)
+            & (updated["gap_to_target"] > eps)
         ].copy()
         if candidates.empty:
             return candidates
+
+        candidates["required_cash"] = pd.to_numeric(candidates["lot_cost"], errors="coerce").fillna(0.0) + max(
+            estimated_fee_per_order, 0.0
+        )
+        candidates = candidates[candidates["required_cash"] <= cash_left + eps]
+        if candidates.empty:
+            return candidates
+
+        candidates["new_gap"] = candidates["gap_to_target"] - candidates["lot_cost"]
+        candidates["improves_gap"] = (candidates["new_gap"].abs() + eps) < candidates["gap_to_target"].abs()
+        candidates = candidates[candidates["improves_gap"] == True]
+        if candidates.empty:
+            return candidates
+
+        if not allow_over_alloc:
+            candidates = candidates[candidates["new_gap"] >= -eps]
+        else:
+            candidates = candidates[candidates["new_gap"] >= (-max_over_alloc_value - eps)]
+            if max_over_alloc_lots_per_ticker <= 0:
+                candidates = candidates[candidates["new_gap"] >= -eps]
+            else:
+                over_limit_mask = []
+                for idx, row in candidates.iterrows():
+                    over_after = float(row["new_gap"]) < -eps
+                    over_count = int(over_alloc_count_by_idx.get(idx, 0))
+                    over_limit_mask.append(not (over_after and over_count >= max_over_alloc_lots_per_ticker))
+                candidates = candidates.loc[over_limit_mask]
+        if candidates.empty:
+            return candidates
+
         if avoid_high_valuation:
             preferred = candidates[~candidates["valuation"].isin(disallowed_when_avoid)]
             if not preferred.empty:
+                return preferred
+            if avoid_high_valuation_strict:
                 return preferred
         return candidates
 
@@ -678,13 +841,27 @@ def apply_secondary_fill(
         deviation_after_lot = abs(float(row["gap_to_target"]) - float(row["lot_cost"]))
         lot_cost = float(row["lot_cost"])
         ticker = str(row.get("ticker", ""))
-        return (float(rank), deviation_after_lot, -lot_cost, ticker)
+        # Prefer smaller lot_cost for finer-grained cash usage under equal deviation.
+        return (float(rank), deviation_after_lot, lot_cost, ticker)
 
-    cash_left = max(total_capital - float(updated["est_value"].sum()), 0.0)
+    cash_left = max(available_budget - float(updated["est_value"].sum()), 0.0)
+    tradable_costs = pd.to_numeric(updated.loc[updated["tradable"] == True, "lot_cost"], errors="coerce")
+    tradable_costs = tradable_costs[tradable_costs > 0]
+    if tradable_costs.empty:
+        step_limit = 0
+    else:
+        min_required_cash = float(tradable_costs.min() + max(estimated_fee_per_order, 0.0))
+        if min_required_cash <= 0:
+            step_limit = max_steps
+        else:
+            theoretical_limit = int(math.floor(cash_left / min_required_cash)) + 1
+            step_limit = min(max_steps, max(theoretical_limit, 0))
+
     steps = 0
     spent = 0.0
+    fee_spent = 0.0
 
-    while cash_left > eps and steps < max_steps:
+    while cash_left > eps and steps < step_limit:
         candidates = candidate_rows(cash_left)
         if candidates.empty:
             break
@@ -692,27 +869,34 @@ def apply_secondary_fill(
         selected_idx = min(candidates.index, key=lambda idx: ranking_key(candidates.loc[idx]))
         row = updated.loc[selected_idx]
         lot_cost = float(row["lot_cost"])
-        if lot_cost <= 0 or lot_cost > cash_left + eps:
+        required_cash = lot_cost + max(estimated_fee_per_order, 0.0)
+        if lot_cost <= 0 or required_cash > cash_left + eps:
             break
 
         updated.at[selected_idx, "lots"] = int(row["lots"]) + 1
         updated.at[selected_idx, "lots_extra"] = int(row.get("lots_extra", 0)) + 1
-        updated.at[selected_idx, "shares"] = int(row["shares"]) + int(row["round_lot"])
-        updated.at[selected_idx, "est_value"] = float(row["est_value"]) + lot_cost
-        updated.at[selected_idx, "gap_to_target"] = float(row["gap_to_target"]) - lot_cost
 
-        cash_left -= lot_cost
+        new_gap = float(row["gap_to_target"]) - lot_cost
+        if new_gap < -eps:
+            over_alloc_count_by_idx[selected_idx] = int(over_alloc_count_by_idx.get(selected_idx, 0)) + 1
+
+        cash_left -= required_cash
         spent += lot_cost
+        fee_spent += max(estimated_fee_per_order, 0.0)
         steps += 1
 
-    # Keep consistent with actual totals after updates.
-    cash_left = max(total_capital - float(updated["est_value"].sum()), 0.0)
+    updated = recompute_position_columns(updated)
+    # Keep consistent with actual totals after updates (including estimated fees spent by fill).
+    cash_left = max(total_capital - float(updated["est_value"].sum()) - float(fee_spent), 0.0)
     return (
         updated,
         {
             "secondary_fill_enabled": bool(enabled),
             "secondary_fill_steps": int(steps),
             "secondary_fill_spent": float(spent),
+            "secondary_fill_fee_spent": float(fee_spent),
+            "secondary_fill_cash_buffer": float(buffer_amount),
+            "secondary_fill_budget_after_buffer": float(available_budget),
             "cash_remaining_after_fill": float(cash_left),
         },
     )
@@ -739,25 +923,25 @@ def build_allocation_table(
     hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
     hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
 
-    close_pre = fetch_close_prices(
+    close_hist = fetch_close_prices(
         rqdatac_module,
         order_book_ids,
         start_date=hist_start,
         end_date=as_of,
         market=portfolio.market,
-        adjust_type="pre",
+        adjust_type="none",
     )
 
     percentile, zscore, q_high, q_extreme = compute_valuation_metrics(
-        close_pre,
+        close_hist,
         window=portfolio.valuation.roll_window,
         sell_quantile=portfolio.valuation.sell_quantile,
         extreme_quantile=portfolio.valuation.extreme_quantile,
     )
 
-    if close_pre.empty:
+    if close_hist.empty:
         raise RuntimeError("No historical HK price data returned; check RQData permissions or ticker list.")
-    latest_row = close_pre.index.max()
+    latest_row = close_hist.index.max()
     target_values = build_target_values(portfolio.total_capital, active, portfolio.allocation_method)
 
     rows: list[dict[str, Any]] = []
@@ -830,7 +1014,15 @@ def build_allocation_table(
         total_capital=portfolio.total_capital,
         enabled=portfolio.secondary_fill_enabled,
         avoid_high_valuation=portfolio.secondary_fill_avoid_high_valuation,
+        avoid_high_valuation_strict=portfolio.secondary_fill_avoid_high_valuation_strict,
         max_steps=portfolio.secondary_fill_max_steps,
+        allow_over_alloc=portfolio.secondary_fill_allow_over_alloc,
+        max_over_alloc_ratio=portfolio.secondary_fill_max_over_alloc_ratio,
+        max_over_alloc_amount=portfolio.secondary_fill_max_over_alloc_amount,
+        max_over_alloc_lots_per_ticker=portfolio.secondary_fill_max_over_alloc_lots_per_ticker,
+        cash_buffer_ratio=portfolio.secondary_fill_cash_buffer_ratio,
+        cash_buffer_amount=portfolio.secondary_fill_cash_buffer_amount,
+        estimated_fee_per_order=portfolio.secondary_fill_estimated_fee_per_order,
     )
 
     allocation_df["lots_base"] = allocation_df["lots"] - allocation_df["lots_extra"]
@@ -866,6 +1058,9 @@ def build_allocation_table(
                 "secondary_fill_enabled": fill_stats["secondary_fill_enabled"],
                 "secondary_fill_steps": fill_stats["secondary_fill_steps"],
                 "secondary_fill_spent": fill_stats["secondary_fill_spent"],
+                "secondary_fill_fee_spent": fill_stats["secondary_fill_fee_spent"],
+                "secondary_fill_cash_buffer": fill_stats["secondary_fill_cash_buffer"],
+                "secondary_fill_budget_after_buffer": fill_stats["secondary_fill_budget_after_buffer"],
                 "cash_remaining_after_fill": fill_stats["cash_remaining_after_fill"],
             }
         ]
@@ -907,7 +1102,9 @@ def build_sell_signals(
         extreme_quantile=portfolio.valuation.extreme_quantile,
     )
 
-    signal = (close_pre >= q_high) & (close_pre.shift(1) < q_high.shift(1))
+    sell_trigger = q_high.shift(1)
+    extreme_trigger = q_extreme.shift(1)
+    signal = (close_pre >= sell_trigger) & (close_pre.shift(1) < sell_trigger)
     latest_row = close_pre.index.max()
 
     rows: list[dict[str, Any]] = []
@@ -923,8 +1120,10 @@ def build_sell_signals(
         current_price = safe_float(close_pre.loc[latest_row, oid]) if oid in close_pre.columns else np.nan
         pct = safe_float(percentile.loc[latest_row, oid]) if oid in percentile.columns else np.nan
         z_1y = safe_float(zscore.loc[latest_row, oid]) if oid in zscore.columns else np.nan
-        high_line = safe_float(q_high.loc[latest_row, oid]) if oid in q_high.columns else np.nan
-        extreme_line = safe_float(q_extreme.loc[latest_row, oid]) if oid in q_extreme.columns else np.nan
+        high_line = safe_float(sell_trigger.loc[latest_row, oid]) if oid in sell_trigger.columns else np.nan
+        extreme_line = (
+            safe_float(extreme_trigger.loc[latest_row, oid]) if oid in extreme_trigger.columns else np.nan
+        )
 
         rows.append(
             {
