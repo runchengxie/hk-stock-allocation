@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
@@ -66,6 +67,8 @@ PRICE_SOURCE_CN_MAP: dict[str, str] = {
 ALLOCATION_EXPORT_ORDER: list[str] = [
     "ticker",
     "name",
+    "rank",
+    "signal",
     "lots",
     "price",
     "valuation",
@@ -93,6 +96,8 @@ ALLOCATION_EXPORT_ORDER: list[str] = [
 ALLOCATION_EXPORT_RENAME: dict[str, str] = {
     "name": "名称",
     "ticker": "股票代码",
+    "rank": "信号排名",
+    "signal": "信号强度",
     "order_book_id": "查询代码",
     "tradable": "可交易",
     "stock_connect": "港股通",
@@ -118,6 +123,9 @@ ALLOCATION_EXPORT_RENAME: dict[str, str] = {
 }
 
 SUMMARY_EXPORT_RENAME: dict[str, str] = {
+    "scenario_id": "场景",
+    "scenario_capital": "场景资金",
+    "scenario_top_n": "场景TopN",
     "as_of": "统计日期",
     "pricing_date": "定价日期",
     "pricing_source": "价格来源",
@@ -138,6 +146,9 @@ SUMMARY_EXPORT_RENAME: dict[str, str] = {
 }
 
 SUMMARY_EXPORT_ORDER: list[str] = [
+    "scenario_id",
+    "scenario_capital",
+    "scenario_top_n",
     "portfolio_name",
     "as_of",
     "pricing_date",
@@ -160,6 +171,8 @@ SUMMARY_EXPORT_ORDER: list[str] = [
 SELL_SIGNALS_EXPORT_RENAME: dict[str, str] = {
     "name": "名称",
     "ticker": "股票代码",
+    "rank": "信号排名",
+    "signal": "信号强度",
     "order_book_id": "查询代码",
     "as_of": "统计日期",
     "close_pre": "前复权收盘价",
@@ -174,6 +187,8 @@ SELL_SIGNALS_EXPORT_RENAME: dict[str, str] = {
 SELL_SIGNALS_EXPORT_ORDER: list[str] = [
     "ticker",
     "name",
+    "rank",
+    "signal",
     "close_pre",
     "valuation",
     "sell_trigger",
@@ -184,6 +199,25 @@ SELL_SIGNALS_EXPORT_ORDER: list[str] = [
     "order_book_id",
     "as_of",
 ]
+
+
+@dataclass(frozen=True)
+class MarketDataBundle:
+    tickers: tuple[str, ...]
+    order_book_ids: tuple[str, ...]
+    ticker_to_oid: dict[str, str]
+    instruments_df: pd.DataFrame
+    latest_prices: pd.DataFrame
+    close_none: pd.DataFrame
+    close_pre: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class ScenarioReport:
+    scenario_id: str
+    allocation_df: pd.DataFrame
+    summary_df: pd.DataFrame
+    sell_signals_df: pd.DataFrame
 
 
 def ticker_to_rq_order_book_id(ticker: str) -> str:
@@ -712,6 +746,75 @@ def _get_previous_trading_date(
     return _to_date(result)
 
 
+def _build_order_book_mapping(ticker_configs: Sequence[TickerConfig]) -> tuple[list[str], list[str], dict[str, str]]:
+    active = get_active_tickers(list(ticker_configs))
+    tickers = [item.ticker for item in active]
+    order_book_ids = [ticker_to_rq_order_book_id(ticker) for ticker in tickers]
+    ticker_to_oid = dict(zip(tickers, order_book_ids))
+    return tickers, order_book_ids, ticker_to_oid
+
+
+def prefetch_market_data(
+    rqdatac_module: Any,
+    portfolio: PortfolioConfig,
+    ticker_configs: Sequence[TickerConfig],
+    as_of: date,
+) -> MarketDataBundle:
+    tickers, order_book_ids, ticker_to_oid = _build_order_book_mapping(ticker_configs)
+    if len(order_book_ids) == 0:
+        raise ValueError("No enabled tickers for market data prefetch")
+
+    instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
+    latest_prices = build_latest_price_frame(
+        rqdatac_module,
+        order_book_ids=order_book_ids,
+        as_of=as_of,
+        market=portfolio.market,
+    )
+
+    hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
+    hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
+
+    close_none = fetch_close_prices(
+        rqdatac_module,
+        order_book_ids,
+        start_date=hist_start,
+        end_date=as_of,
+        market=portfolio.market,
+        adjust_type="none",
+    )
+    close_pre = fetch_close_prices(
+        rqdatac_module,
+        order_book_ids,
+        start_date=hist_start,
+        end_date=as_of,
+        market=portfolio.market,
+        adjust_type="pre",
+    )
+
+    return MarketDataBundle(
+        tickers=tuple(tickers),
+        order_book_ids=tuple(order_book_ids),
+        ticker_to_oid=ticker_to_oid,
+        instruments_df=instruments_df,
+        latest_prices=latest_prices,
+        close_none=close_none,
+        close_pre=close_pre,
+    )
+
+
+def _subset_market_data(bundle: MarketDataBundle, order_book_ids: Sequence[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    missing = [oid for oid in order_book_ids if oid not in bundle.order_book_ids]
+    if missing:
+        raise ValueError(f"Market data bundle missing order_book_ids: {', '.join(missing)}")
+
+    instruments = bundle.instruments_df.reindex(list(order_book_ids))
+    latest_prices = bundle.latest_prices.reindex(list(order_book_ids))
+    close_none = bundle.close_none.reindex(columns=list(order_book_ids))
+    close_pre = bundle.close_pre.reindex(columns=list(order_book_ids))
+    return instruments, latest_prices, close_none, close_pre
+
+
 def apply_secondary_fill(
     allocation_df: pd.DataFrame,
     total_capital: float,
@@ -907,30 +1010,31 @@ def build_allocation_table(
     portfolio: PortfolioConfig,
     ticker_configs: Sequence[TickerConfig],
     as_of: date,
+    market_data: MarketDataBundle | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     active = get_active_tickers(list(ticker_configs))
-    tickers = [item.ticker for item in active]
-    order_book_ids = [ticker_to_rq_order_book_id(ticker) for ticker in tickers]
-    ticker_to_oid = dict(zip(tickers, order_book_ids))
-    instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
-    latest_prices = build_latest_price_frame(
-        rqdatac_module,
-        order_book_ids=order_book_ids,
-        as_of=as_of,
-        market=portfolio.market,
-    )
+    tickers, order_book_ids, ticker_to_oid = _build_order_book_mapping(active)
+    if market_data is None:
+        instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
+        latest_prices = build_latest_price_frame(
+            rqdatac_module,
+            order_book_ids=order_book_ids,
+            as_of=as_of,
+            market=portfolio.market,
+        )
 
-    hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
-    hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
-
-    close_hist = fetch_close_prices(
-        rqdatac_module,
-        order_book_ids,
-        start_date=hist_start,
-        end_date=as_of,
-        market=portfolio.market,
-        adjust_type="none",
-    )
+        hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
+        hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
+        close_hist = fetch_close_prices(
+            rqdatac_module,
+            order_book_ids,
+            start_date=hist_start,
+            end_date=as_of,
+            market=portfolio.market,
+            adjust_type="none",
+        )
+    else:
+        instruments_df, latest_prices, close_hist, _ = _subset_market_data(market_data, order_book_ids)
 
     percentile, zscore, q_high, q_extreme = compute_valuation_metrics(
         close_hist,
@@ -981,6 +1085,8 @@ def build_allocation_table(
                 "ticker": ticker,
                 "order_book_id": oid,
                 "name": _resolve_display_name(item.name, symbol),
+                "rank": item.rank,
+                "signal": item.signal,
                 "price": price,
                 "price_source": price_source,
                 "pricing_date": pricing_date,
@@ -1074,24 +1180,24 @@ def build_sell_signals(
     portfolio: PortfolioConfig,
     ticker_configs: Sequence[TickerConfig],
     as_of: date,
+    market_data: MarketDataBundle | None = None,
 ) -> pd.DataFrame:
     active = get_active_tickers(list(ticker_configs))
-    tickers = [item.ticker for item in active]
-    order_book_ids = [ticker_to_rq_order_book_id(ticker) for ticker in tickers]
-    ticker_to_oid = dict(zip(tickers, order_book_ids))
-    instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
-
-    hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
-    hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
-
-    close_pre = fetch_close_prices(
-        rqdatac_module,
-        order_book_ids,
-        start_date=hist_start,
-        end_date=as_of,
-        market=portfolio.market,
-        adjust_type="pre",
-    )
+    tickers, order_book_ids, ticker_to_oid = _build_order_book_mapping(active)
+    if market_data is None:
+        instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
+        hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
+        hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
+        close_pre = fetch_close_prices(
+            rqdatac_module,
+            order_book_ids,
+            start_date=hist_start,
+            end_date=as_of,
+            market=portfolio.market,
+            adjust_type="pre",
+        )
+    else:
+        instruments_df, _, _, close_pre = _subset_market_data(market_data, order_book_ids)
     if close_pre.empty:
         raise RuntimeError("No historical HK price data returned; cannot build sell signals.")
 
@@ -1129,6 +1235,8 @@ def build_sell_signals(
             {
                 "name": _resolve_display_name(item.name, symbol),
                 "ticker": ticker,
+                "rank": item.rank,
+                "signal": item.signal,
                 "order_book_id": oid,
                 "as_of": _to_date(latest_row),
                 "close_pre": current_price,
@@ -1234,4 +1342,63 @@ def write_report(
         allocation_export.to_excel(writer, sheet_name="分配", index=False)
         summary_export.to_excel(writer, sheet_name="汇总", index=False)
         sell_signals_export.to_excel(writer, sheet_name="卖出信号", index=False)
+    return output_path
+
+
+def _make_unique_sheet_name(raw_name: str, existing: set[str]) -> str:
+    safe = re.sub(r"[:\\/?*\[\]]", "_", str(raw_name)).strip()
+    safe = safe or "Sheet"
+    safe = safe[:31]
+    if safe not in existing:
+        existing.add(safe)
+        return safe
+
+    base = safe
+    counter = 2
+    while True:
+        suffix = f"_{counter}"
+        candidate = f"{base[: max(31 - len(suffix), 1)]}{suffix}"
+        if candidate not in existing:
+            existing.add(candidate)
+            return candidate
+        counter += 1
+
+
+def write_scenario_grid_report(
+    output_path: Path,
+    scenario_reports: Sequence[ScenarioReport],
+) -> Path:
+    if len(scenario_reports) == 0:
+        raise ValueError("scenario_reports must not be empty")
+
+    overview_rows: list[pd.DataFrame] = []
+    for report in scenario_reports:
+        summary = report.summary_df.copy()
+        summary["scenario_id"] = report.scenario_id
+        overview_rows.append(summary)
+
+    overview_df = pd.concat(overview_rows, ignore_index=True)
+    overview_export = _prepare_summary_export_df(overview_df)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    used_sheet_names: set[str] = set()
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        overview_sheet = _make_unique_sheet_name("场景总览", used_sheet_names)
+        overview_export.to_excel(writer, sheet_name=overview_sheet, index=False)
+
+        for report in scenario_reports:
+            allocation_export = _prepare_allocation_export_df(report.allocation_df)
+            summary = report.summary_df.copy()
+            summary["scenario_id"] = report.scenario_id
+            summary_export = _prepare_summary_export_df(summary)
+            sell_signals_export = _prepare_sell_signals_export_df(report.sell_signals_df)
+
+            allocation_sheet = _make_unique_sheet_name(f"{report.scenario_id}_分配", used_sheet_names)
+            summary_sheet = _make_unique_sheet_name(f"{report.scenario_id}_汇总", used_sheet_names)
+            sell_sheet = _make_unique_sheet_name(f"{report.scenario_id}_卖出", used_sheet_names)
+
+            allocation_export.to_excel(writer, sheet_name=allocation_sheet, index=False)
+            summary_export.to_excel(writer, sheet_name=summary_sheet, index=False)
+            sell_signals_export.to_excel(writer, sheet_name=sell_sheet, index=False)
+
     return output_path

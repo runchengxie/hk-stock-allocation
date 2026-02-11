@@ -4,12 +4,13 @@
 
 ## 功能
 
-- 从 `configs/portfolio.yml` 读取股票清单、资金规模和参数
+- 从 `configs/universe/portfolio.yml` 读取策略参数，并支持从 `positions_current_live.csv` 读取标的快照（含 `rank/signal/weight`）
 - 按港股一手(`round_lot`)约束计算每只股票可买手数和金额偏差
 - 分配定价采用分层回退：`snapshot` -> `1m close` -> `1d close`
 - 输出估值分层（统计价格高位，不是基本面估值）和卖出触发时间
 - `secondary_fill` 支持现金缓冲、估算费用、超配上限和严格规则约束
-- 生成 Excel 报表（工作表名：`分配` / `汇总` / `卖出信号`）
+- 生成 Excel 报表（单场景：`分配`/`汇总`/`卖出信号`；多场景：`场景总览` + 每场景三张表）
+- 支持 `资金 x TopN` 场景矩阵（如 3x3）；行情只抓一次，后续场景复用计算
 
 ## 环境要求
 
@@ -32,7 +33,7 @@ uv sync --group dev
 
 ## 配置
 
-默认配置文件：`configs/portfolio.yml`
+默认配置文件：`configs/universe/portfolio.yml`
 
 关键字段：
 
@@ -41,7 +42,12 @@ uv sync --group dev
 - `portfolio.allocation.secondary_fill`: 逐手补仓参数（见下方策略说明）
 - `portfolio.trading.require_stock_connect`: 是否只允许港股通标的
 - `portfolio.valuation`: 历史窗口和估值阈值参数
-- `tickers[].ticker`: 股票代码（格式 `00941.HK`）
+- `universe.positions_csv`: 标的快照 CSV 路径（支持相对配置文件路径）
+- `universe.side` / `universe.positions_side`: side 过滤，默认 `long`
+- `scenarios.capitals`: 情景资金列表（如 `[1000000, 500000, 100000]`）
+- `scenarios.top_ns`: 情景 TopN 列表（如 `[20, 10, 5]`）
+
+兼容旧模式：若不配置 `universe.positions_csv`，仍可使用 `tickers[].ticker` 直接在 YAML 写标的。
 
 `custom` 分配时，需为每个启用标的提供 `weight`。
 
@@ -60,13 +66,13 @@ uv sync --group dev
 ## 运行
 
 ```bash
-uv run hk-alloc --config configs/portfolio.yml
+uv run hk-alloc --config configs/universe/portfolio.yml
 ```
 
 可选参数：
 
 ```bash
-uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output output/manual.xlsx
+uv run hk-alloc --config configs/universe/portfolio.yml --as-of 2026-02-10 --output output/manual.xlsx
 ```
 
 也可以直接用脚本入口：
@@ -82,6 +88,7 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 `allocation` 表核心字段：
 
 - `ticker`: 输入代码（兼容历史项目）
+- `rank`, `signal`: 信号排名与强度（来自 CSV）
 - `order_book_id`: RQData 查询代码（`XXXXX.XHKG`）
 - `price`, `price_source`, `pricing_date`
 - `round_lot`, `lots_base`, `lots_extra`, `lots`, `shares`
@@ -108,6 +115,7 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 - `pricing_source`, `pricing_source_detail`
 - `secondary_fill_steps`, `secondary_fill_spent`, `secondary_fill_fee_spent`
 - `secondary_fill_cash_buffer`, `secondary_fill_budget_after_buffer`, `cash_remaining_after_fill`
+- `scenario_id`, `scenario_capital`, `scenario_top_n`（多场景时）
 - `cash_remaining_after_fill` 已扣除补仓买入金额与 `secondary_fill_fee_spent`
 `summary` 表默认左侧优先列：`组合名称`、`统计日期`、`定价日期`、`价格来源`、`价格来源明细`、`标的数量`。
 
@@ -116,6 +124,7 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 - `sell_trigger`: 偏高阈值
 - `extreme_trigger`: 极高阈值
 - `last_sell_signal_date`: 最近一次上穿卖出阈值日期
+- `rank`, `signal`: 同步输出信号排名与强度
 - 卖出信号按“前一交易日已确定阈值”判断：`close_t >= trigger_{t-1}` 且 `close_{t-1} < trigger_{t-1}`
 `sell_signals` 表默认左侧优先列：`股票代码`、`名称`、`前复权收盘价`、`估值分层`、`偏高阈值`、`极高阈值`。
 

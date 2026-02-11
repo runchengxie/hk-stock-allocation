@@ -3,7 +3,7 @@ portfolio:
   currency: HKD
   total_capital: 1000000
   allocation:
-    method: equal
+    method: custom
     secondary_fill:
       enabled: true
       avoid_high_valuation: true
@@ -25,24 +25,10 @@ portfolio:
     sell_quantile: 0.95
     extreme_quantile: 0.99
 
-tickers:
-  - ticker: "00941.HK"
-  - ticker: "09987.HK"
-  - ticker: "01211.HK"
-  - ticker: "06160.HK"
-  - ticker: "00316.HK"
-  - ticker: "06855.HK"
-  - ticker: "02020.HK"
-  - ticker: "02238.HK"
-  - ticker: "09606.HK"
-  - ticker: "00884.HK"
-  - ticker: "03690.HK"
-  - ticker: "00669.HK"
-  - ticker: "00300.HK"
-  - ticker: "01928.HK"
-  - ticker: "01024.HK"
-  - ticker: "02359.HK"
-  - ticker: "03033.HK"
-  - ticker: "02015.HK"
-  - ticker: "00728.HK"
-  - ticker: "00762.HK"
+universe:
+  positions_csv: ../positions_current_live.csv
+  side: long
+
+scenarios:
+  capitals: [1000000, 500000, 100000]
+  top_ns: [20, 10, 5]

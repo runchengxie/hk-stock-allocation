@@ -6,6 +6,8 @@ import pytest
 
 from hk_alloc.config_loader import PortfolioConfig, TickerConfig, ValuationConfig
 from hk_alloc.rq_helpers import (
+    MarketDataBundle,
+    ScenarioReport,
     _is_stock_connect_tradable,
     _normalize_close_output,
     _prepare_allocation_export_df,
@@ -17,6 +19,7 @@ from hk_alloc.rq_helpers import (
     build_sell_signals,
     fetch_instruments,
     write_report,
+    write_scenario_grid_report,
 )
 
 
@@ -180,6 +183,35 @@ def test_write_report_uses_chinese_sheet_names(tmp_path: Path) -> None:
         assert xls.sheet_names == ["分配", "汇总", "卖出信号"]
 
 
+def test_write_scenario_grid_report_writes_overview_and_scenario_sheets(tmp_path: Path) -> None:
+    report_a = ScenarioReport(
+        scenario_id="C100w_N20",
+        allocation_df=pd.DataFrame([{"ticker": "00941.HK", "lots": 2}]),
+        summary_df=pd.DataFrame([{"portfolio_name": "hk_core_20", "total_capital": 1_000_000.0}]),
+        sell_signals_df=pd.DataFrame([{"ticker": "00941.HK", "valuation": "HIGH"}]),
+    )
+    report_b = ScenarioReport(
+        scenario_id="C50w_N10",
+        allocation_df=pd.DataFrame([{"ticker": "01211.HK", "lots": 1}]),
+        summary_df=pd.DataFrame([{"portfolio_name": "hk_core_20", "total_capital": 500_000.0}]),
+        sell_signals_df=pd.DataFrame([{"ticker": "01211.HK", "valuation": "LOW"}]),
+    )
+
+    out_path = tmp_path / "scenario_grid.xlsx"
+    write_scenario_grid_report(out_path, [report_a, report_b])
+
+    with pd.ExcelFile(out_path) as xls:
+        assert xls.sheet_names == [
+            "场景总览",
+            "C100w_N20_分配",
+            "C100w_N20_汇总",
+            "C100w_N20_卖出",
+            "C50w_N10_分配",
+            "C50w_N10_汇总",
+            "C50w_N10_卖出",
+        ]
+
+
 def test_prepare_summary_export_df_orders_and_localizes() -> None:
     summary = pd.DataFrame(
         [
@@ -321,6 +353,76 @@ def test_build_allocation_table_uses_unadjusted_history_for_thresholds() -> None
     assert calls
     assert set(calls) == {"none"}
     assert "overpriced_high" in allocation_df.columns
+
+
+def test_build_allocation_and_sell_signals_use_prefetched_bundle() -> None:
+    class DummyRQ:
+        pass
+
+    portfolio = PortfolioConfig(
+        name="demo",
+        currency="HKD",
+        total_capital=100_000,
+        secondary_fill_enabled=False,
+        valuation=ValuationConfig(
+            history_years=1,
+            roll_window=2,
+            sell_quantile=0.8,
+            extreme_quantile=0.9,
+        ),
+    )
+    tickers = [TickerConfig(ticker="00941.HK", rank=1, signal=0.123)]
+    oid = "00941.XHKG"
+
+    instruments_df = pd.DataFrame(
+        [{"order_book_id": oid, "symbol": "China Mobile", "round_lot": 500, "stock_connect": ["sh", "sz"]}]
+    ).set_index("order_book_id")
+    latest_prices = pd.DataFrame(
+        index=[oid],
+        data={
+            "price": [80.0],
+            "price_source": ["1d_close"],
+            "pricing_ts": [pd.Timestamp("2026-02-10")],
+            "pricing_date": [pd.Timestamp("2026-02-10").date()],
+        },
+    )
+    close_none = pd.DataFrame(
+        {oid: [78.0, 79.0, 80.0]},
+        index=pd.to_datetime(["2026-02-08", "2026-02-09", "2026-02-10"]),
+    )
+    close_pre = pd.DataFrame(
+        {oid: [1.0, 0.5, 2.0]},
+        index=pd.to_datetime(["2026-02-08", "2026-02-09", "2026-02-10"]),
+    )
+    bundle = MarketDataBundle(
+        tickers=("00941.HK",),
+        order_book_ids=(oid,),
+        ticker_to_oid={"00941.HK": oid},
+        instruments_df=instruments_df,
+        latest_prices=latest_prices,
+        close_none=close_none,
+        close_pre=close_pre,
+    )
+
+    allocation_df, _ = build_allocation_table(
+        DummyRQ(),
+        portfolio=portfolio,
+        ticker_configs=tickers,
+        as_of=pd.Timestamp("2026-02-10").date(),
+        market_data=bundle,
+    )
+    sell_df = build_sell_signals(
+        DummyRQ(),
+        portfolio=portfolio,
+        ticker_configs=tickers,
+        as_of=pd.Timestamp("2026-02-10").date(),
+        market_data=bundle,
+    )
+
+    assert allocation_df.loc[0, "rank"] == 1
+    assert allocation_df.loc[0, "signal"] == 0.123
+    assert sell_df.loc[0, "rank"] == 1
+    assert sell_df.loc[0, "signal"] == 0.123
 
 
 def test_build_sell_signals_uses_prior_day_trigger_for_cross() -> None:
