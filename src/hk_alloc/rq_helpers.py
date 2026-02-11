@@ -1,14 +1,116 @@
 from __future__ import annotations
 
 import math
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 from .config_loader import PortfolioConfig, TickerConfig, get_active_tickers
+
+
+VALUATION_CN_MAP: dict[str, str] = {
+    "LOW": "偏低",
+    "NEUTRAL": "中性",
+    "HIGH": "偏高",
+    "EXTREME": "极高",
+    "NA": "NA",
+}
+
+PRICE_SOURCE_CN_MAP: dict[str, str] = {
+    "snapshot": "快照最新价",
+    "1m_close": "1分钟收盘",
+    "1d_close": "日线收盘",
+    "mixed": "混合",
+}
+
+ALLOCATION_EXPORT_ORDER: list[str] = [
+    "ticker",
+    "lots",
+    "valuation",
+    "overpriced_high",
+    "name",
+    "order_book_id",
+    "tradable",
+    "stock_connect",
+    "price_source",
+    "pricing_date",
+    "price",
+    "round_lot",
+    "lot_cost",
+    "target_value",
+    "lots_base",
+    "lots_extra",
+    "shares",
+    "est_value",
+    "gap_to_target",
+    "gap_ratio",
+    "pct_1y",
+    "z_1y",
+    "overpriced_low",
+    "overpriced_range",
+]
+
+ALLOCATION_EXPORT_RENAME: dict[str, str] = {
+    "name": "名称",
+    "ticker": "股票代码",
+    "order_book_id": "查询代码",
+    "tradable": "可交易",
+    "stock_connect": "港股通",
+    "price_source": "价格来源",
+    "pricing_date": "定价日期",
+    "price": "当前价格",
+    "round_lot": "每手股数",
+    "lot_cost": "每手成本",
+    "target_value": "目标金额",
+    "lots_base": "初始手数",
+    "lots_extra": "补仓手数",
+    "lots": "合计手数",
+    "shares": "股数",
+    "est_value": "预计金额",
+    "gap_to_target": "与目标差额",
+    "gap_ratio": "偏离比例",
+    "valuation": "估值分层",
+    "pct_1y": "1年分位",
+    "z_1y": "1年Z分",
+    "overpriced_low": "高估下沿",
+    "overpriced_high": "高估上沿",
+    "overpriced_range": "高估区间",
+}
+
+SUMMARY_EXPORT_RENAME: dict[str, str] = {
+    "as_of": "统计日期",
+    "pricing_date": "定价日期",
+    "pricing_source": "价格来源",
+    "pricing_source_detail": "价格来源明细",
+    "portfolio_name": "组合名称",
+    "num_tickers": "标的数量",
+    "total_capital": "总资金",
+    "total_est_value": "预计总金额",
+    "total_gap": "总差额",
+    "cash_used_ratio": "资金使用率",
+    "secondary_fill_enabled": "启用二次补仓",
+    "secondary_fill_steps": "补仓步数",
+    "secondary_fill_spent": "补仓金额",
+    "cash_remaining_after_fill": "补仓后剩余现金",
+}
+
+SELL_SIGNALS_EXPORT_RENAME: dict[str, str] = {
+    "name": "名称",
+    "ticker": "股票代码",
+    "order_book_id": "查询代码",
+    "as_of": "统计日期",
+    "close_pre": "前复权收盘价",
+    "pct_1y": "1年分位",
+    "z_1y": "1年Z分",
+    "sell_trigger": "偏高阈值",
+    "extreme_trigger": "极高阈值",
+    "last_sell_signal_date": "最近卖出信号日期",
+    "valuation": "估值分层",
+}
 
 
 def ticker_to_rq_order_book_id(ticker: str) -> str:
@@ -89,6 +191,19 @@ def _get_instrument_field(instruments_df: pd.DataFrame, oid: str, field: str, de
     if _is_missing_value(value):
         return default
     return value
+
+
+def _get_attr_or_key(record: Any, key: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(key)
+    return getattr(record, key, None)
+
+
+def _to_timestamp(value: Any) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if isinstance(ts, pd.Timestamp):
+        return ts
+    return pd.NaT
 
 
 def classify_valuation(
@@ -236,6 +351,172 @@ def fetch_close_prices(
         expect_df=True,
     )
     return _normalize_close_output(px, order_book_ids)
+
+
+def _empty_live_price_frame(order_book_ids: Sequence[str]) -> pd.DataFrame:
+    return pd.DataFrame(
+        index=list(order_book_ids),
+        data={"price": np.nan, "pricing_ts": pd.NaT},
+    )
+
+
+def fetch_snapshot_prices(
+    rqdatac_module: Any,
+    order_book_ids: Sequence[str],
+    market: str,
+) -> pd.DataFrame:
+    empty = _empty_live_price_frame(order_book_ids)
+
+    try:
+        snapshots = rqdatac_module.current_snapshot(list(order_book_ids), market=market)
+    except Exception:
+        return empty
+
+    if snapshots is None:
+        return empty
+    if not isinstance(snapshots, list):
+        snapshots = [snapshots]
+
+    rows: list[dict[str, Any]] = []
+    for snap in snapshots:
+        if snap is None:
+            continue
+
+        oid = _get_attr_or_key(snap, "order_book_id")
+        if _is_missing_value(oid):
+            continue
+
+        last = safe_float(_get_attr_or_key(snap, "last"))
+        close = safe_float(_get_attr_or_key(snap, "close"))
+        price = last if last > 0 else close if close > 0 else np.nan
+        pricing_ts = _to_timestamp(_get_attr_or_key(snap, "datetime"))
+        rows.append(
+            {
+                "order_book_id": str(oid),
+                "price": price,
+                "pricing_ts": pricing_ts,
+            }
+        )
+
+    if not rows:
+        return empty
+
+    snap_df = pd.DataFrame(rows).drop_duplicates(subset=["order_book_id"], keep="last")
+    snap_df = snap_df.set_index("order_book_id")[["price", "pricing_ts"]]
+
+    empty.update(snap_df)
+    return empty
+
+
+def fetch_current_minute_prices(
+    rqdatac_module: Any,
+    order_book_ids: Sequence[str],
+    market: str,
+) -> pd.DataFrame:
+    empty = _empty_live_price_frame(order_book_ids)
+
+    minute_df: pd.DataFrame | None
+    try:
+        minute_df = rqdatac_module.current_minute(list(order_book_ids), fields=["close"], market=market)
+    except TypeError:
+        try:
+            minute_df = rqdatac_module.current_minute(list(order_book_ids), market=market)
+        except Exception:
+            return empty
+    except Exception:
+        return empty
+
+    if minute_df is None or minute_df.empty:
+        return empty
+
+    frame = minute_df.reset_index()
+    if "order_book_id" not in frame.columns:
+        return empty
+
+    price_field = "close" if "close" in frame.columns else "last" if "last" in frame.columns else None
+    if price_field is None:
+        return empty
+    if "datetime" not in frame.columns:
+        frame["datetime"] = pd.NaT
+
+    frame["price"] = pd.to_numeric(frame[price_field], errors="coerce")
+    frame["pricing_ts"] = pd.to_datetime(frame["datetime"], errors="coerce")
+    frame = frame.sort_values(["order_book_id", "pricing_ts"], na_position="last")
+    frame = frame.groupby("order_book_id", as_index=False).tail(1)
+
+    latest = frame.set_index("order_book_id")[["price", "pricing_ts"]]
+    empty.update(latest)
+    return empty
+
+
+def _should_try_live_prices(as_of: date, market: str) -> bool:
+    market_key = str(market).strip().lower()
+    if market_key == "hk":
+        today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+        return as_of == today
+    return as_of == datetime.now().date()
+
+
+def build_latest_price_frame(
+    rqdatac_module: Any,
+    order_book_ids: Sequence[str],
+    as_of: date,
+    market: str,
+) -> pd.DataFrame:
+    price_start = _get_previous_trading_date(rqdatac_module, as_of, n=10, market=market)
+    close_today = fetch_close_prices(
+        rqdatac_module,
+        order_book_ids,
+        start_date=price_start,
+        end_date=as_of,
+        market=market,
+        adjust_type="none",
+    )
+    if close_today.empty:
+        raise RuntimeError("No recent HK close price returned for allocation.")
+
+    close_today_clean = close_today.dropna(how="all")
+    if close_today_clean.empty:
+        raise RuntimeError("Recent HK close prices are all missing for the selected tickers.")
+
+    latest_close_ts = pd.Timestamp(close_today_clean.index[-1])
+    latest_close_row = close_today_clean.iloc[-1].reindex(list(order_book_ids))
+
+    price_frame = pd.DataFrame(
+        index=list(order_book_ids),
+        data={
+            "price": pd.to_numeric(latest_close_row, errors="coerce"),
+            "price_source": "1d_close",
+            "pricing_ts": latest_close_ts,
+        },
+    )
+
+    if _should_try_live_prices(as_of=as_of, market=market):
+        snapshot_frame = fetch_snapshot_prices(rqdatac_module, order_book_ids, market=market)
+        minute_frame = fetch_current_minute_prices(rqdatac_module, order_book_ids, market=market)
+
+        for oid in order_book_ids:
+            snapshot_price = safe_float(snapshot_frame.at[oid, "price"])
+            if snapshot_price > 0:
+                price_frame.at[oid, "price"] = snapshot_price
+                price_frame.at[oid, "price_source"] = "snapshot"
+                snapshot_ts = _to_timestamp(snapshot_frame.at[oid, "pricing_ts"])
+                if pd.notna(snapshot_ts):
+                    price_frame.at[oid, "pricing_ts"] = snapshot_ts
+                continue
+
+            minute_price = safe_float(minute_frame.at[oid, "price"])
+            if minute_price > 0:
+                price_frame.at[oid, "price"] = minute_price
+                price_frame.at[oid, "price_source"] = "1m_close"
+                minute_ts = _to_timestamp(minute_frame.at[oid, "pricing_ts"])
+                if pd.notna(minute_ts):
+                    price_frame.at[oid, "pricing_ts"] = minute_ts
+
+    price_frame["pricing_date"] = pd.to_datetime(price_frame["pricing_ts"], errors="coerce").dt.date
+    fallback_date = _to_date(latest_close_ts)
+    price_frame["pricing_date"] = price_frame["pricing_date"].fillna(fallback_date)
+    return price_frame
 
 
 def _last_value_percentile(values: np.ndarray) -> float:
@@ -416,19 +697,12 @@ def build_allocation_table(
     tickers = [item.ticker for item in active]
     order_book_ids = [ticker_to_rq_order_book_id(ticker) for ticker in tickers]
     ticker_to_oid = dict(zip(tickers, order_book_ids))
-
     instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
-
-    # Use the latest available close within a short lookback window.
-    # On the current trading date, daily close may be unavailable before market close.
-    price_start = _get_previous_trading_date(rqdatac_module, as_of, n=10, market=portfolio.market)
-    close_today = fetch_close_prices(
+    latest_prices = build_latest_price_frame(
         rqdatac_module,
-        order_book_ids,
-        start_date=price_start,
-        end_date=as_of,
+        order_book_ids=order_book_ids,
+        as_of=as_of,
         market=portfolio.market,
-        adjust_type="none",
     )
 
     hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
@@ -454,12 +728,6 @@ def build_allocation_table(
         raise RuntimeError("No historical HK price data returned; check RQData permissions or ticker list.")
     latest_row = close_pre.index.max()
     target_values = build_target_values(portfolio.total_capital, active, portfolio.allocation_method)
-    if close_today.empty:
-        raise RuntimeError("No recent HK close price returned for allocation.")
-    close_today_clean = close_today.dropna(how="all")
-    if close_today_clean.empty:
-        raise RuntimeError("Recent HK close prices are all missing for the selected tickers.")
-    price_row = close_today_clean.iloc[-1]
 
     rows: list[dict[str, Any]] = []
     for item in active:
@@ -469,7 +737,9 @@ def build_allocation_table(
         symbol = _get_instrument_field(instruments_df, oid, "symbol", None)
         round_lot = safe_float(_get_instrument_field(instruments_df, oid, "round_lot", np.nan))
         stock_connect = _get_instrument_field(instruments_df, oid, "stock_connect", None)
-        price = safe_float(price_row.get(oid, np.nan))
+        price = safe_float(latest_prices.at[oid, "price"])
+        price_source = str(latest_prices.at[oid, "price_source"])
+        pricing_date = _to_date(latest_prices.at[oid, "pricing_date"])
 
         is_connect_tradable = _is_stock_connect_tradable(stock_connect)
         tradable = (not portfolio.require_stock_connect or is_connect_tradable) and price > 0 and round_lot > 0
@@ -497,6 +767,8 @@ def build_allocation_table(
                 "order_book_id": oid,
                 "name": _resolve_display_name(item.name, symbol),
                 "price": price,
+                "price_source": price_source,
+                "pricing_date": pricing_date,
                 "round_lot": round_lot,
                 "stock_connect": stock_connect,
                 "target_value": target_value,
@@ -529,11 +801,27 @@ def build_allocation_table(
         avoid_high_valuation=portfolio.secondary_fill_avoid_high_valuation,
         max_steps=portfolio.secondary_fill_max_steps,
     )
+
+    allocation_df["lots_base"] = allocation_df["lots"] - allocation_df["lots_extra"]
+    allocation_df["gap_ratio"] = np.where(
+        allocation_df["target_value"] > 0,
+        allocation_df["gap_to_target"] / allocation_df["target_value"],
+        np.nan,
+    )
+
+    pricing_dates = pd.to_datetime(latest_prices["pricing_date"], errors="coerce").dropna()
+    summary_pricing_date = _to_date(pricing_dates.max()) if not pricing_dates.empty else as_of
+    source_counts = latest_prices["price_source"].value_counts(dropna=False).to_dict()
+    source_parts = [f"{str(source)}:{int(count)}" for source, count in source_counts.items()]
+    summary_pricing_source = next(iter(source_counts.keys())) if len(source_counts) == 1 else "mixed"
+
     summary_df = pd.DataFrame(
         [
             {
                 "as_of": as_of,
-                "pricing_date": _to_date(close_today_clean.index[-1]),
+                "pricing_date": summary_pricing_date,
+                "pricing_source": summary_pricing_source,
+                "pricing_source_detail": ", ".join(source_parts),
                 "portfolio_name": portfolio.name,
                 "num_tickers": len(active),
                 "total_capital": portfolio.total_capital,
@@ -565,6 +853,7 @@ def build_sell_signals(
     tickers = [item.ticker for item in active]
     order_book_ids = [ticker_to_rq_order_book_id(ticker) for ticker in tickers]
     ticker_to_oid = dict(zip(tickers, order_book_ids))
+    instruments_df = fetch_instruments(rqdatac_module, order_book_ids, market=portfolio.market)
 
     hist_days = max(portfolio.valuation.history_years * 252, portfolio.valuation.roll_window + 5)
     hist_start = _get_previous_trading_date(rqdatac_module, as_of, n=hist_days, market=portfolio.market)
@@ -594,6 +883,7 @@ def build_sell_signals(
     for item in active:
         ticker = item.ticker
         oid = ticker_to_oid[ticker]
+        symbol = _get_instrument_field(instruments_df, oid, "symbol", None)
         col_signal = signal[oid].fillna(False)
 
         signal_dates = col_signal.index[col_signal]
@@ -607,6 +897,7 @@ def build_sell_signals(
 
         rows.append(
             {
+                "name": _resolve_display_name(item.name, symbol),
                 "ticker": ticker,
                 "order_book_id": oid,
                 "as_of": _to_date(latest_row),
@@ -628,15 +919,86 @@ def build_sell_signals(
     return pd.DataFrame(rows)
 
 
+def _to_yes_no(value: Any) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if _is_missing_value(value):
+        return "否"
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "是"}:
+        return "是"
+    if text in {"false", "0", "no", "n", "否"}:
+        return "否"
+    return str(value)
+
+
+def _format_stock_connect(value: Any) -> str:
+    if isinstance(value, (list, tuple, set)):
+        tokens = {str(item).strip().lower() for item in value if not _is_missing_value(item)}
+        if "sh" in tokens and "sz" in tokens:
+            return "沪/深"
+        if "sh" in tokens:
+            return "沪"
+        if "sz" in tokens:
+            return "深"
+        return "是" if len(tokens) > 0 else "否"
+    return "是" if _is_stock_connect_tradable(value) else "否"
+
+
+def _localize_price_source(value: Any) -> str:
+    text = str(value).strip() if not _is_missing_value(value) else ""
+    return PRICE_SOURCE_CN_MAP.get(text, text or "未知")
+
+
+def _prepare_allocation_export_df(allocation_df: pd.DataFrame) -> pd.DataFrame:
+    out = allocation_df.copy()
+    if "tradable" in out.columns:
+        out["tradable"] = out["tradable"].map(_to_yes_no)
+    if "stock_connect" in out.columns:
+        out["stock_connect"] = out["stock_connect"].map(_format_stock_connect)
+    if "valuation" in out.columns:
+        out["valuation"] = out["valuation"].map(lambda x: VALUATION_CN_MAP.get(str(x), str(x)))
+    if "price_source" in out.columns:
+        out["price_source"] = out["price_source"].map(_localize_price_source)
+
+    ordered_cols = [col for col in ALLOCATION_EXPORT_ORDER if col in out.columns]
+    extra_cols = [col for col in out.columns if col not in ordered_cols]
+    out = out[ordered_cols + extra_cols]
+    return out.rename(columns=ALLOCATION_EXPORT_RENAME)
+
+
+def _prepare_summary_export_df(summary_df: pd.DataFrame) -> pd.DataFrame:
+    out = summary_df.copy()
+    if "secondary_fill_enabled" in out.columns:
+        out["secondary_fill_enabled"] = out["secondary_fill_enabled"].map(_to_yes_no)
+    if "pricing_source" in out.columns:
+        out["pricing_source"] = out["pricing_source"].map(_localize_price_source)
+    return out.rename(columns=SUMMARY_EXPORT_RENAME)
+
+
+def _prepare_sell_signals_export_df(sell_signals_df: pd.DataFrame) -> pd.DataFrame:
+    out = sell_signals_df.copy()
+    if "valuation" in out.columns:
+        out["valuation"] = out["valuation"].map(lambda x: VALUATION_CN_MAP.get(str(x), str(x)))
+    ordered = [col for col in SELL_SIGNALS_EXPORT_RENAME if col in out.columns]
+    extras = [col for col in out.columns if col not in ordered]
+    out = out[ordered + extras]
+    return out.rename(columns=SELL_SIGNALS_EXPORT_RENAME)
+
+
 def write_report(
     output_path: Path,
     allocation_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     sell_signals_df: pd.DataFrame,
 ) -> Path:
+    allocation_export = _prepare_allocation_export_df(allocation_df)
+    summary_export = _prepare_summary_export_df(summary_df)
+    sell_signals_export = _prepare_sell_signals_export_df(sell_signals_df)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        allocation_df.to_excel(writer, sheet_name="allocation", index=False)
-        summary_df.to_excel(writer, sheet_name="summary", index=False)
-        sell_signals_df.to_excel(writer, sheet_name="sell_signals", index=False)
+        allocation_export.to_excel(writer, sheet_name="allocation", index=False)
+        summary_export.to_excel(writer, sheet_name="summary", index=False)
+        sell_signals_export.to_excel(writer, sheet_name="sell_signals", index=False)
     return output_path

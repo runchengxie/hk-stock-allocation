@@ -6,6 +6,7 @@
 
 - 从 `configs/portfolio.yml` 读取股票清单、资金规模和参数
 - 按港股一手(`round_lot`)约束计算每只股票可买手数和金额偏差
+- 分配定价采用分层回退：`snapshot` -> `1m close` -> `1d close`
 - 输出估值分层（统计高位）和卖出触发时间
 - 生成 Excel 报表（`allocation` / `summary` / `sell_signals`）
 
@@ -67,10 +68,15 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 
 - `ticker`: 输入代码（兼容历史项目）
 - `order_book_id`: RQData 查询代码（`XXXXX.XHKG`）
-- `price`, `round_lot`, `lots`, `shares`, `est_value`, `gap_to_target`
-- `lot_cost`, `lots_extra`: 单手成本与二次分配新增手数
+- `price`, `price_source`, `pricing_date`
+- `round_lot`, `lots_base`, `lots_extra`, `lots`, `shares`
+- `est_value`, `gap_to_target`, `gap_ratio`
+- `lot_cost`: 单手成本
 - `valuation`: `LOW/NEUTRAL/HIGH/EXTREME`
 - `overpriced_low` / `overpriced_high`: 统计高位阈值区间
+
+导出到 Excel 时会自动转换为中文列名与中文值（如估值分层、价格来源、港股通/可交易状态）。
+`allocation` 表默认左侧优先列：`股票代码`、`合计手数`、`估值分层`、`高估上沿`。
 
 启用 `secondary_fill` 后，个别标的 `gap_to_target` 可能为负（代表超配一手）；
 但组合层面的 `total_gap` 会尽量压低到“剩余现金 < 任一可买一手成本”。
@@ -78,6 +84,7 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 `summary` 表：
 
 - `total_est_value`, `total_gap`, `cash_used_ratio`
+- `pricing_source`, `pricing_source_detail`
 - `secondary_fill_steps`, `secondary_fill_spent`, `cash_remaining_after_fill`
 
 `sell_signals` 表：
