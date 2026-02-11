@@ -208,3 +208,6 @@ output/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# debugging purpose
+full_project_source.txt
