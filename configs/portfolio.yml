@@ -19,11 +19,8 @@ portfolio:
 
 tickers:
   - ticker: "00941.HK"
-    name: China Mobile
   - ticker: "09987.HK"
-    name: Yum China
   - ticker: "01211.HK"
-    name: BYD
   - ticker: "06160.HK"
   - ticker: "00316.HK"
   - ticker: "06855.HK"
