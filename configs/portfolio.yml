@@ -1,0 +1,43 @@
+portfolio:
+  name: hk_core_20
+  currency: HKD
+  total_capital: 1000000
+  allocation:
+    method: equal
+    secondary_fill:
+      enabled: true
+      avoid_high_valuation: true
+      max_steps: 100000
+  trading:
+    market: hk
+    require_stock_connect: true
+  valuation:
+    history_years: 3
+    roll_window: 252
+    sell_quantile: 0.95
+    extreme_quantile: 0.99
+
+tickers:
+  - ticker: "00941.HK"
+    name: China Mobile
+  - ticker: "09987.HK"
+    name: Yum China
+  - ticker: "01211.HK"
+    name: BYD
+  - ticker: "06160.HK"
+  - ticker: "00316.HK"
+  - ticker: "06855.HK"
+  - ticker: "02020.HK"
+  - ticker: "02238.HK"
+  - ticker: "09606.HK"
+  - ticker: "00884.HK"
+  - ticker: "03690.HK"
+  - ticker: "00669.HK"
+  - ticker: "00300.HK"
+  - ticker: "01928.HK"
+  - ticker: "01024.HK"
+  - ticker: "02359.HK"
+  - ticker: "03033.HK"
+  - ticker: "02015.HK"
+  - ticker: "00728.HK"
+  - ticker: "00762.HK"
