@@ -29,16 +29,16 @@ PRICE_SOURCE_CN_MAP: dict[str, str] = {
 
 ALLOCATION_EXPORT_ORDER: list[str] = [
     "ticker",
+    "name",
     "lots",
+    "price",
     "valuation",
     "overpriced_high",
-    "name",
     "order_book_id",
     "tradable",
     "stock_connect",
     "price_source",
     "pricing_date",
-    "price",
     "round_lot",
     "lot_cost",
     "target_value",
@@ -98,6 +98,23 @@ SUMMARY_EXPORT_RENAME: dict[str, str] = {
     "cash_remaining_after_fill": "补仓后剩余现金",
 }
 
+SUMMARY_EXPORT_ORDER: list[str] = [
+    "portfolio_name",
+    "as_of",
+    "pricing_date",
+    "pricing_source",
+    "pricing_source_detail",
+    "num_tickers",
+    "total_capital",
+    "total_est_value",
+    "total_gap",
+    "cash_used_ratio",
+    "secondary_fill_enabled",
+    "secondary_fill_steps",
+    "secondary_fill_spent",
+    "cash_remaining_after_fill",
+]
+
 SELL_SIGNALS_EXPORT_RENAME: dict[str, str] = {
     "name": "名称",
     "ticker": "股票代码",
@@ -111,6 +128,20 @@ SELL_SIGNALS_EXPORT_RENAME: dict[str, str] = {
     "last_sell_signal_date": "最近卖出信号日期",
     "valuation": "估值分层",
 }
+
+SELL_SIGNALS_EXPORT_ORDER: list[str] = [
+    "ticker",
+    "name",
+    "close_pre",
+    "valuation",
+    "sell_trigger",
+    "extreme_trigger",
+    "last_sell_signal_date",
+    "pct_1y",
+    "z_1y",
+    "order_book_id",
+    "as_of",
+]
 
 
 def ticker_to_rq_order_book_id(ticker: str) -> str:
@@ -973,6 +1004,9 @@ def _prepare_summary_export_df(summary_df: pd.DataFrame) -> pd.DataFrame:
         out["secondary_fill_enabled"] = out["secondary_fill_enabled"].map(_to_yes_no)
     if "pricing_source" in out.columns:
         out["pricing_source"] = out["pricing_source"].map(_localize_price_source)
+    ordered_cols = [col for col in SUMMARY_EXPORT_ORDER if col in out.columns]
+    extra_cols = [col for col in out.columns if col not in ordered_cols]
+    out = out[ordered_cols + extra_cols]
     return out.rename(columns=SUMMARY_EXPORT_RENAME)
 
 
@@ -980,9 +1014,9 @@ def _prepare_sell_signals_export_df(sell_signals_df: pd.DataFrame) -> pd.DataFra
     out = sell_signals_df.copy()
     if "valuation" in out.columns:
         out["valuation"] = out["valuation"].map(lambda x: VALUATION_CN_MAP.get(str(x), str(x)))
-    ordered = [col for col in SELL_SIGNALS_EXPORT_RENAME if col in out.columns]
-    extras = [col for col in out.columns if col not in ordered]
-    out = out[ordered + extras]
+    ordered_cols = [col for col in SELL_SIGNALS_EXPORT_ORDER if col in out.columns]
+    extra_cols = [col for col in out.columns if col not in ordered_cols]
+    out = out[ordered_cols + extra_cols]
     return out.rename(columns=SELL_SIGNALS_EXPORT_RENAME)
 
 
@@ -998,7 +1032,7 @@ def write_report(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        allocation_export.to_excel(writer, sheet_name="allocation", index=False)
-        summary_export.to_excel(writer, sheet_name="summary", index=False)
-        sell_signals_export.to_excel(writer, sheet_name="sell_signals", index=False)
+        allocation_export.to_excel(writer, sheet_name="分配", index=False)
+        summary_export.to_excel(writer, sheet_name="汇总", index=False)
+        sell_signals_export.to_excel(writer, sheet_name="卖出信号", index=False)
     return output_path

@@ -8,7 +8,7 @@
 - 按港股一手(`round_lot`)约束计算每只股票可买手数和金额偏差
 - 分配定价采用分层回退：`snapshot` -> `1m close` -> `1d close`
 - 输出估值分层（统计高位）和卖出触发时间
-- 生成 Excel 报表（`allocation` / `summary` / `sell_signals`）
+- 生成 Excel 报表（工作表名：`分配` / `汇总` / `卖出信号`）
 
 ## 环境要求
 
@@ -76,7 +76,7 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 - `overpriced_low` / `overpriced_high`: 统计高位阈值区间
 
 导出到 Excel 时会自动转换为中文列名与中文值（如估值分层、价格来源、港股通/可交易状态）。
-`allocation` 表默认左侧优先列：`股票代码`、`合计手数`、`估值分层`、`高估上沿`。
+`allocation` 表默认左侧优先列：`股票代码`、`名称`、`合计手数`、`当前价格`、`估值分层`、`高估上沿`。
 
 启用 `secondary_fill` 后，个别标的 `gap_to_target` 可能为负（代表超配一手）；
 但组合层面的 `total_gap` 会尽量压低到“剩余现金 < 任一可买一手成本”。
@@ -86,12 +86,14 @@ uv run hk-alloc --config configs/portfolio.yml --as-of 2026-02-10 --output outpu
 - `total_est_value`, `total_gap`, `cash_used_ratio`
 - `pricing_source`, `pricing_source_detail`
 - `secondary_fill_steps`, `secondary_fill_spent`, `cash_remaining_after_fill`
+`summary` 表默认左侧优先列：`组合名称`、`统计日期`、`定价日期`、`价格来源`、`价格来源明细`、`标的数量`。
 
 `sell_signals` 表：
 
 - `sell_trigger`: 偏高阈值
 - `extreme_trigger`: 极高阈值
 - `last_sell_signal_date`: 最近一次上穿卖出阈值日期
+`sell_signals` 表默认左侧优先列：`股票代码`、`名称`、`前复权收盘价`、`估值分层`、`偏高阈值`、`极高阈值`。
 
 ## 测试
 

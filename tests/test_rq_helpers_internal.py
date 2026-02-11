@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -5,9 +6,12 @@ import pandas as pd
 from hk_alloc.rq_helpers import (
     _normalize_close_output,
     _prepare_allocation_export_df,
+    _prepare_sell_signals_export_df,
+    _prepare_summary_export_df,
     _resolve_display_name,
     build_latest_price_frame,
     fetch_instruments,
+    write_report,
 )
 
 
@@ -152,8 +156,72 @@ def test_prepare_allocation_export_df_localizes_headers_and_values() -> None:
     )
 
     out = _prepare_allocation_export_df(allocation)
-    assert list(out.columns[:5]) == ["股票代码", "合计手数", "估值分层", "高估上沿", "名称"]
+    assert list(out.columns[:6]) == ["股票代码", "名称", "合计手数", "当前价格", "估值分层", "高估上沿"]
     assert out.loc[0, "可交易"] == "是"
     assert out.loc[0, "港股通"] == "沪/深"
     assert out.loc[0, "价格来源"] == "快照最新价"
+    assert out.loc[0, "估值分层"] == "偏高"
+
+
+def test_write_report_uses_chinese_sheet_names(tmp_path: Path) -> None:
+    allocation = pd.DataFrame([{"ticker": "00941.HK", "name": "中国移动", "lots": 2, "price": 80.5}])
+    summary = pd.DataFrame([{"portfolio_name": "hk_core_20"}])
+    sell_signals = pd.DataFrame([{"ticker": "00941.HK", "valuation": "HIGH"}])
+
+    out_path = tmp_path / "report.xlsx"
+    write_report(out_path, allocation, summary, sell_signals)
+
+    with pd.ExcelFile(out_path) as xls:
+        assert xls.sheet_names == ["分配", "汇总", "卖出信号"]
+
+
+def test_prepare_summary_export_df_orders_and_localizes() -> None:
+    summary = pd.DataFrame(
+        [
+            {
+                "as_of": pd.Timestamp("2026-02-11").date(),
+                "pricing_date": pd.Timestamp("2026-02-11").date(),
+                "pricing_source": "snapshot",
+                "pricing_source_detail": "snapshot:20",
+                "portfolio_name": "hk_core_20",
+                "num_tickers": 20,
+                "total_capital": 1_000_000.0,
+                "total_est_value": 980_000.0,
+                "total_gap": 20_000.0,
+                "cash_used_ratio": 0.98,
+                "secondary_fill_enabled": True,
+                "secondary_fill_steps": 3,
+                "secondary_fill_spent": 60_000.0,
+                "cash_remaining_after_fill": 20_000.0,
+            }
+        ]
+    )
+
+    out = _prepare_summary_export_df(summary)
+    assert list(out.columns[:6]) == ["组合名称", "统计日期", "定价日期", "价格来源", "价格来源明细", "标的数量"]
+    assert out.loc[0, "价格来源"] == "快照最新价"
+    assert out.loc[0, "启用二次补仓"] == "是"
+
+
+def test_prepare_sell_signals_export_df_orders_and_localizes() -> None:
+    sell_signals = pd.DataFrame(
+        [
+            {
+                "name": "中国移动",
+                "ticker": "00941.HK",
+                "order_book_id": "00941.XHKG",
+                "as_of": pd.Timestamp("2026-02-11").date(),
+                "close_pre": 80.5,
+                "pct_1y": 0.98,
+                "z_1y": 2.1,
+                "sell_trigger": 0.95,
+                "extreme_trigger": 0.99,
+                "last_sell_signal_date": pd.Timestamp("2026-01-20").date(),
+                "valuation": "HIGH",
+            }
+        ]
+    )
+
+    out = _prepare_sell_signals_export_df(sell_signals)
+    assert list(out.columns[:6]) == ["股票代码", "名称", "前复权收盘价", "估值分层", "偏高阈值", "极高阈值"]
     assert out.loc[0, "估值分层"] == "偏高"
