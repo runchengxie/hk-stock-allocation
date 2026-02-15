@@ -13,7 +13,7 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 ZIP_PATH="${OUT_DIR}/${NAME}_${STAMP}.zip"
 
 # Exclusion list (7z format)
-EXCLUDE_FILE="${ROOT}/scripts/7z_exclusion_list.txt"
+EXCLUDE_FILE="${ROOT}/project_tools/7z_exclusion_list.txt"
 
 cd "$ROOT"
 
